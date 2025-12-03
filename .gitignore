@@ -1,3 +1,6 @@
 wandb
 .idea
 ptsa.egg-info
+venv/
+data/
+output/
