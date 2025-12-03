@@ -3,6 +3,7 @@ import os
 import logging
 import argparse
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn
@@ -29,6 +30,52 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 best_f1_score = 0.0
+
+
+
+def log_detailed_metrics(targets, predictions):
+    targets = np.array(targets)
+    predictions = np.array(predictions)
+
+    binary_predictions = (predictions >= 0.5).astype(int)
+    
+    accuracy = accuracy_score(targets, binary_predictions)
+    precision = precision_score(targets, binary_predictions)
+    recall = recall_score(targets, binary_predictions)
+    auc_roc = roc_auc_score(targets, predictions)
+    f1 = f1_score(targets, binary_predictions)
+    
+    precisions, recalls, thresholds = precision_recall_curve(targets, predictions)
+    avg_precision = average_precision_score(targets, predictions)
+    
+    wandb.log({
+        "detailed_accuracy": accuracy,
+        "detailed_precision": precision,
+        "detailed_recall": recall,
+        "detailed_auc_roc": auc_roc,
+        "average_precision": avg_precision,
+        "f1-score": f1
+    })
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(recalls, precisions, label=f'AP={avg_precision:.2f}')
+    plt.title('Precision-Recall Curve')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.legend()
+    
+    wandb.log({"pr_curve": wandb.Image(plt)})
+    plt.close()
+
+    # Return all metrics as a dictionary
+    return {
+        'f1': f1,
+        'auroc': auc_roc,
+        'auprc': avg_precision,
+        'precision': precision,
+        'recall': recall,
+        'accuracy': accuracy
+    }
 
 def even_out_number_of_data_points(data):
     data_points, labels = data[0], data[1]
@@ -241,7 +288,7 @@ def objective(trial):
 
 
         pos_weight_tensor = torch.tensor([pos_weight], device=device)
-        criterion = nn.BCELoss(weight=pos_weight_tensor)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
         optimizer = torch.optim.Adam(model.parameters(), lr=config["learning_rate"], weight_decay=config["weight_decay"])
 
         for epoch in range(config["num_epochs"]):
@@ -350,7 +397,7 @@ def objective(trial):
         predictions = [pred[0] for pred in all_predictions]
         targets = [target[0] for target in all_targets]
         
-        f1_score_testing = log_detailed_metrics(targets, predictions)
+        metrics = log_detailed_metrics(targets, predictions)
         
         model_path = os.path.join(args.output_dir, f"{args.model}/final_model_trial_{trial.number}.pth")
         logger.info("Saving final model to: %s", model_path)
@@ -359,17 +406,23 @@ def objective(trial):
         artifact = wandb.Artifact(
                     name=f'model-trial-{trial.number}',
                     type='model',
-                    description=f'Best model for trial {trial.number} with F1={f1_score_testing:.4f}'
+                    description=f'Best model for trial {trial.number} with F1={metrics["f1"]:.4f}'
                 )
         artifact.add_file(model_path, f"final_model_trial_{trial.number}.pth")
         artifact.save()
-        # run.log_artifact(artifact)
-
         
-
+        # Store metrics in trial user attributes for later retrieval
+        trial.set_user_attr('auroc', metrics['auroc'])
+        trial.set_user_attr('auprc', metrics['auprc'])
+        trial.set_user_attr('precision', metrics['precision'])
+        trial.set_user_attr('recall', metrics['recall'])
+        trial.set_user_attr('f1', metrics['f1'])
+        # run.log_artifact(artifact)
+ 
         auc_roc = roc_auc_score(targets, predictions)
 
-        return f1_score_testing
+        #return f1_score_testing
+        return metrics['f1']
     
     finally:
         wandb.finish()
@@ -421,10 +474,43 @@ def main():
         for key, value in trial.params.items():
             f.write(f"{key}: {value}\n")
 
-    optuna.visualization.plot_optimization_history(study)
-    plt.savefig(os.path.join(args.output_dir, 'optimization_history.png'))
-    optuna.visualization.plot_param_importances(study)
-    plt.savefig(os.path.join(args.output_dir, 'param_importances.png'))
+        # Create results table
+    results_data = {
+        'Model': [args.model.upper()],
+        'Dataset': ['MIMIC'],
+        'AUROC': [f"{trial.user_attrs.get('auroc', 0.0):.4f}"],
+        'AUPRC': [f"{trial.user_attrs.get('auprc', 0.0):.4f}"],
+        'Precision': [f"{trial.user_attrs.get('precision', 0.0):.4f}"],
+        'Recall': [f"{trial.user_attrs.get('recall', 0.0):.4f}"],
+        'F1-Score': [f"{trial.user_attrs.get('f1', 0.0):.4f}"]
+    }
+    
+    results_df = pd.DataFrame(results_data)
+    
+    # Save as CSV
+    csv_path = os.path.join(args.output_dir, 'results_table.csv')
+    results_df.to_csv(csv_path, index=False)
+    logger.info(f"Results table saved to: {csv_path}")
+    
+    # Save as formatted text table
+    txt_path = os.path.join(args.output_dir, 'results_table.txt')
+    with open(txt_path, 'w') as f:
+        f.write(results_df.to_string(index=False))
+    logger.info(f"Results table (txt) saved to: {txt_path}")
+    
+    # Print the table
+    print("\nFinal Results:")
+    print(results_df.to_string(index=False))
+
+    #optuna.visualization.plot_optimization_history(study)
+    #plt.savefig(os.path.join(args.output_dir, 'optimization_history.png'))
+    #optuna.visualization.plot_param_importances(study)
+    #plt.savefig(os.path.join(args.output_dir, 'param_importances.png'))
+    fig = optuna.visualization.plot_optimization_history(study)
+    fig.write_image(os.path.join(args.output_dir, 'optimization_history.png'))
+
+    fig = optuna.visualization.plot_param_importances(study)
+    fig.write_image(os.path.join(args.output_dir, 'param_importances.png'))
 
 if __name__ == "__main__":
     main()
