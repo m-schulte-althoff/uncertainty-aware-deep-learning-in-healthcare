@@ -15,3 +15,7 @@ _fixed: MIMIC-IV
 _own_final: INALO
 
 **both data unbalanced**
+
+BUT: evaluation is happening on a downsampled/balanced test set...
+    -> metrics not completely representative of real-world
+And: results are non-deterministic since no seeding..
