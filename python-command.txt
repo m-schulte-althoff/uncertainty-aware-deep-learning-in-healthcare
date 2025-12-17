@@ -3,6 +3,7 @@ python ptsa/tasks/in_hospital_mortality/train_deterministic.py --network ptsa/mo
 
 ---
 python ptsa/tasks/in_hospital_mortality/train_deterministic.py --network ptsa/models/deterministic/lstm.py --partition custom --data data/in-hospital-mortality-fixed/ --model lstm --model_name lstm_classification.py --output_dir output/
+python ptsa/tasks/in_hospital_mortality/train_probabilistic.py   --network ptsa/models/probabilistic/lstm_classification.py   --partition custom   --data data/in-hospital-mortality-fixed/   --model lstm   --model_name lstm_probabilistic.pth   --output_dir output/   --num_trials 10
 
 plus: pip install -e .
 plus: pip install numpy==1.26.4 tqdm==4.67.1 torch==2.6.0 scikit-learn==1.7.0 optuna==4.4.0 wandb==0.21.0 matplotlib==3.10.3
