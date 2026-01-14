@@ -56,9 +56,8 @@ class LSTM(nn.Module):
         predictions = torch.stack(predictions)
         mean = predictions.mean(dim=0)
 
-        model_variance = predictions.var(dim=0)
-        aleatoric_variance = torch.exp(torch.stack(log_variances).mean(dim=0))
-        total_variance = model_variance + aleatoric_variance
+        epistemic_variance = predictions.var(dim=0)  # From MC Dropout
+        aleatoric_variance = torch.exp(torch.stack(log_variances).mean(dim=0))  # From heteroscedastic output
 
-        return mean, total_variance
+        return mean, epistemic_variance, aleatoric_variance
 

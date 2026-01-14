@@ -117,7 +117,7 @@ class TransformerIHM(nn.Module):
         num_samples: int = 100,
         src_mask: Optional[torch.Tensor] = None,
         src_key_padding_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.train()
         
         probas = []
@@ -134,10 +134,7 @@ class TransformerIHM(nn.Module):
 
         mean_proba = torch.clamp(mean_proba, min=1e-6, max=1-1e-6)
         
-        epistemic_uncertainty = probas.var(dim=0)
-
-        aleatoric_uncertainty = torch.exp(torch.stack(log_variances).mean(dim=0))
-
-        total_uncertainty = epistemic_uncertainty + aleatoric_uncertainty
+        epistemic_variance = probas.var(dim=0)  # From MC Dropout
+        aleatoric_variance = torch.exp(torch.stack(log_variances).mean(dim=0))  # From heteroscedastic output
         
-        return mean_proba, total_uncertainty
+        return mean_proba, epistemic_variance, aleatoric_variance

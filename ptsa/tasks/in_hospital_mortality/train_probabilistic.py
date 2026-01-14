@@ -2,6 +2,7 @@ import os
 import logging
 import argparse
 import numpy as np
+import pandas as pd
 from sklearn.model_selection import train_test_split
 import torch
 from torch import nn
@@ -78,7 +79,7 @@ def calculate_class_weights(labels):
     return pos_weight
 
 
-def log_detailed_metrics(targets, predictions):
+def log_detailed_metrics(targets, predictions, mean_epistemic=None, mean_aleatoric=None):
     targets = np.array(targets)
     predictions = np.array(predictions)
     
@@ -99,6 +100,8 @@ def log_detailed_metrics(targets, predictions):
         "detailed_recall": recall,
         "detailed_auc_roc": auc_roc,
         "average_precision": avg_precision,
+        "f1-score": f1,
+        "average_precision": avg_precision,
         "f1-score": f1
     })
     
@@ -112,7 +115,17 @@ def log_detailed_metrics(targets, predictions):
     wandb.log({"pr_curve": wandb.Image(plt)})
     plt.close()
 
-    return f1
+    # Return all metrics as a dictionary
+    return {
+        'f1': f1,
+        'auroc': auc_roc,
+        'auprc': avg_precision,
+        'precision': precision,
+        'recall': recall,
+        'accuracy': accuracy,
+        'mean_epistemic': mean_epistemic,
+        'mean_aleatoric': mean_aleatoric
+    }
 
 def binary_classification_uncertainty_loss(pred_proba, pred_log_var, targets, pos_weight):
             variance = torch.exp(pred_log_var)
@@ -423,7 +436,8 @@ def objective(trial):
         model.eval()
         all_predictions = []
         all_targets = []
-        all_uncertainties = []
+        all_epistemic = []
+        all_aleatoric = []
         
         with torch.no_grad():
             for i in range(len(test_raw[0])):
@@ -436,40 +450,52 @@ def objective(trial):
                 
                 # outputs = model(x).view(-1)
 
-                mean, variance = model.predict_with_uncertainty(x, num_samples=config["num_mc_samples"])
+                mean, epistemic_var, aleatoric_var = model.predict_with_uncertainty(x, num_samples=config["num_mc_samples"])
                 
                 all_predictions.append(mean.cpu().numpy())
-                all_uncertainties.append(variance.cpu().numpy())
+                all_epistemic.append(epistemic_var.cpu().numpy())
+                all_aleatoric.append(aleatoric_var.cpu().numpy())
                 all_targets.append(y.cpu().numpy())
 
         predictions = [pred for pred in all_predictions]
         targets = [target[0] for target in all_targets]
         
-        f1_score_testing = log_detailed_metrics(targets, predictions)
+        mean_epistemic = np.mean(all_epistemic)
+        mean_aleatoric = np.mean(all_aleatoric)
         
-        model_path = os.path.join(args.output_dir, f"{args.model}/final_model_trial_{trial.number}.pth")
+        metrics = log_detailed_metrics(targets, predictions, mean_epistemic, mean_aleatoric)
+        
+        model_path = os.path.join(args.output_dir, f"final_model_trial_{trial.number}.pth")
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
         logger.info("Saving final model to: %s", model_path)
         torch.save(model.state_dict(), model_path)
         
         artifact = wandb.Artifact(
                     name=f'model-trial-{trial.number}',
                     type='model',
-                    description=f'Best model for trial {trial.number} with F1={f1_score_testing:.4f}'
+                    description=f'Best model for trial {trial.number} with F1={metrics["f1"]:.4f}'
                 )
         artifact.add_file(model_path, f"final_model_trial_{trial.number}.pth")
         artifact.save()
         # run.log_artifact(artifact)
 
-        # mean_uncertainty_concat = np.concatenate(all_uncertainties, axis=0)
-        mean_uncertainty = np.mean(all_uncertainties)
-        
         wandb.log({
-            "Mean Uncertainty": mean_uncertainty
+            "Mean Epistemic Uncertainty": mean_epistemic,
+            "Mean Aleatoric Uncertainty": mean_aleatoric
         })
+        
+        # Store metrics in trial user attributes for later retrieval
+        trial.set_user_attr('auroc', metrics['auroc'])
+        trial.set_user_attr('auprc', metrics['auprc'])
+        trial.set_user_attr('precision', metrics['precision'])
+        trial.set_user_attr('recall', metrics['recall'])
+        trial.set_user_attr('f1', metrics['f1'])
+        trial.set_user_attr('mean_epistemic', mean_epistemic)
+        trial.set_user_attr('mean_aleatoric', mean_aleatoric)
 
         auc_roc = roc_auc_score(targets, predictions)
 
-        return f1_score_testing
+        return metrics['f1']
     
     except RuntimeError as e:
         print(f"Error in training step:")
@@ -506,6 +532,14 @@ def main():
     global args
     args = parser.parse_args()
     
+    # Extract dataset name from data path for output organization
+    dataset_name = os.path.basename(os.path.normpath(args.data))
+    
+    # Build output directory structure: {output_dir}/{dataset}/{probabilistic}/{model}/
+    args.output_dir = os.path.join(args.output_dir, dataset_name, "probabilistic", args.model)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger.info(f"Output directory: {args.output_dir}")
+
     study = optuna.create_study(
         direction='maximize', 
         pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=6)
@@ -529,10 +563,51 @@ def main():
         for key, value in trial.params.items():
             f.write(f"{key}: {value}\n")
 
-    optuna.visualization.plot_optimization_history(study)
-    plt.savefig(os.path.join(args.output_dir, 'optimization_history.png'))
-    optuna.visualization.plot_param_importances(study)
-    plt.savefig(os.path.join(args.output_dir, 'param_importances.png'))
+    # Determine dataset display name
+    dataset_display = "MIMIC" if "fixed" in dataset_name else "INALO"
+    
+    # Create results table
+    results_data = {
+        'Model': [f"{args.model.upper()} + MC Dropout"],
+        'Dataset': [dataset_display],
+        'AUROC': [f"{trial.user_attrs.get('auroc', 0.0):.4f}"],
+        'AUPRC': [f"{trial.user_attrs.get('auprc', 0.0):.4f}"],
+        'Precision': [f"{trial.user_attrs.get('precision', 0.0):.4f}"],
+        'Recall': [f"{trial.user_attrs.get('recall', 0.0):.4f}"],
+        'F1-Score': [f"{trial.user_attrs.get('f1', 0.0):.4f}"],
+        'Aleatoric Uncertainty': [f"{trial.user_attrs.get('mean_aleatoric', 0.0):.6f}"],
+        'Epistemic Uncertainty': [f"{trial.user_attrs.get('mean_epistemic', 0.0):.6f}"]
+    }
+    
+    results_df = pd.DataFrame(results_data)
+    
+    # Save as CSV
+    csv_path = os.path.join(args.output_dir, 'results_table.csv')
+    results_df.to_csv(csv_path, index=False)
+    logger.info(f"Results table saved to: {csv_path}")
+    
+    # Save as formatted text table
+    txt_path = os.path.join(args.output_dir, 'results_table.txt')
+    with open(txt_path, 'w') as f:
+        f.write(results_df.to_string(index=False))
+    logger.info(f"Results table (txt) saved to: {txt_path}")
+    
+    # Print the table
+    print("\nFinal Results:")
+    print(results_df.to_string(index=False))
+
+    # Generate visualizations (may fail with single trial)
+    try:
+        fig = optuna.visualization.plot_optimization_history(study)
+        fig.write_image(os.path.join(args.output_dir, 'optimization_history.png'))
+    except Exception as e:
+        logger.warning(f"Could not generate optimization history plot: {e}")
+
+    try:
+        fig = optuna.visualization.plot_param_importances(study)
+        fig.write_image(os.path.join(args.output_dir, 'param_importances.png'))
+    except Exception as e:
+        logger.warning(f"Could not generate param importances plot: {e}")
 
 if __name__ == "__main__":
     main()

@@ -125,43 +125,6 @@ def calculate_class_weights(labels):
     return pos_weight
 
 
-def log_detailed_metrics(targets, predictions):
-    targets = np.array(targets)
-    predictions = np.array(predictions)
-
-    binary_predictions = (predictions >= 0.5).astype(int)
-    
-    accuracy = accuracy_score(targets, binary_predictions)
-    precision = precision_score(targets, binary_predictions)
-    recall = recall_score(targets, binary_predictions)
-    auc_roc = roc_auc_score(targets, predictions)
-    f1 = f1_score(targets, binary_predictions)
-    
-    precisions, recalls, thresholds = precision_recall_curve(targets, predictions)
-    avg_precision = average_precision_score(targets, predictions)
-    
-    wandb.log({
-        "detailed_accuracy": accuracy,
-        "detailed_precision": precision,
-        "detailed_recall": recall,
-        "detailed_auc_roc": auc_roc,
-        "average_precision": avg_precision,
-        "f1-score": f1
-    })
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(recalls, precisions, label=f'AP={avg_precision:.2f}')
-    plt.title('Precision-Recall Curve')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.legend()
-    
-    wandb.log({"pr_curve": wandb.Image(plt)})
-    plt.close()
-
-    return f1
-
-
 def objective(trial):
     wandb.finish()
 
@@ -399,7 +362,8 @@ def objective(trial):
         
         metrics = log_detailed_metrics(targets, predictions)
         
-        model_path = os.path.join(args.output_dir, f"{args.model}/final_model_trial_{trial.number}.pth")
+        model_path = os.path.join(args.output_dir, f"final_model_trial_{trial.number}.pth")
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
         logger.info("Saving final model to: %s", model_path)
         torch.save(model.state_dict(), model_path)
         
@@ -451,6 +415,14 @@ def main():
     global args
     args = parser.parse_args()
 
+    # Extract dataset name from data path for output organization
+    dataset_name = os.path.basename(os.path.normpath(args.data))
+    
+    # Build output directory structure: {output_dir}/{dataset}/{deterministic}/{model}/
+    args.output_dir = os.path.join(args.output_dir, dataset_name, "deterministic", args.model)
+    os.makedirs(args.output_dir, exist_ok=True)
+    logger.info(f"Output directory: {args.output_dir}")
+
     study = optuna.create_study(
         direction='maximize', 
         pruner=optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=6)
@@ -474,15 +446,20 @@ def main():
         for key, value in trial.params.items():
             f.write(f"{key}: {value}\n")
 
-        # Create results table
+    # Determine dataset display name
+    dataset_display = "MIMIC" if "fixed" in dataset_name else "INALO"
+    
+    # Create results table
     results_data = {
         'Model': [args.model.upper()],
-        'Dataset': ['MIMIC'],
+        'Dataset': [dataset_display],
         'AUROC': [f"{trial.user_attrs.get('auroc', 0.0):.4f}"],
         'AUPRC': [f"{trial.user_attrs.get('auprc', 0.0):.4f}"],
         'Precision': [f"{trial.user_attrs.get('precision', 0.0):.4f}"],
         'Recall': [f"{trial.user_attrs.get('recall', 0.0):.4f}"],
-        'F1-Score': [f"{trial.user_attrs.get('f1', 0.0):.4f}"]
+        'F1-Score': [f"{trial.user_attrs.get('f1', 0.0):.4f}"],
+        'Aleatoric Uncertainty': ['–'],
+        'Epistemic Uncertainty': ['–']
     }
     
     results_df = pd.DataFrame(results_data)
@@ -502,15 +479,18 @@ def main():
     print("\nFinal Results:")
     print(results_df.to_string(index=False))
 
-    #optuna.visualization.plot_optimization_history(study)
-    #plt.savefig(os.path.join(args.output_dir, 'optimization_history.png'))
-    #optuna.visualization.plot_param_importances(study)
-    #plt.savefig(os.path.join(args.output_dir, 'param_importances.png'))
-    fig = optuna.visualization.plot_optimization_history(study)
-    fig.write_image(os.path.join(args.output_dir, 'optimization_history.png'))
+    # Generate visualizations (may fail with single trial)
+    try:
+        fig = optuna.visualization.plot_optimization_history(study)
+        fig.write_image(os.path.join(args.output_dir, 'optimization_history.png'))
+    except Exception as e:
+        logger.warning(f"Could not generate optimization history plot: {e}")
 
-    fig = optuna.visualization.plot_param_importances(study)
-    fig.write_image(os.path.join(args.output_dir, 'param_importances.png'))
+    try:
+        fig = optuna.visualization.plot_param_importances(study)
+        fig.write_image(os.path.join(args.output_dir, 'param_importances.png'))
+    except Exception as e:
+        logger.warning(f"Could not generate param importances plot: {e}")
 
 if __name__ == "__main__":
     main()
