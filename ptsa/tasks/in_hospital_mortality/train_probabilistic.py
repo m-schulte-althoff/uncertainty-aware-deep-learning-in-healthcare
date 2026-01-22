@@ -470,6 +470,13 @@ def objective(trial):
         logger.info("Saving final model to: %s", model_path)
         torch.save(model.state_dict(), model_path)
         
+        # Save model config for this trial
+        config_path = os.path.join(args.output_dir, f"config_trial_{trial.number}.json")
+        import json
+        with open(config_path, 'w') as f:
+            json.dump(config, f, indent=2)
+        logger.info("Saving config to: %s", config_path)
+        
         artifact = wandb.Artifact(
                     name=f'model-trial-{trial.number}',
                     type='model',

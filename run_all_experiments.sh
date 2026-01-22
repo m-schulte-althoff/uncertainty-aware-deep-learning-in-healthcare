@@ -1,6 +1,10 @@
 #!/bin/bash
 # Run all experiments to fill out the results table
-# This script trains all model/dataset combinations for both deterministic and probabilistic versions
+# This script trains models on MIMIC data and evaluates on both MIMIC and INALO test sets
+#
+# IMPORTANT: Models are ONLY trained on MIMIC data. They are then evaluated on:
+#   1. MIMIC test set (in-domain evaluation)
+#   2. INALO test set (out-of-domain/transfer evaluation)
 #
 # Usage: 
 #   ./run_all_experiments.sh                     # Run all experiments
@@ -8,9 +12,8 @@
 #   ./run_all_experiments.sh -m lstm,gru         # Run LSTM and GRU models
 #   ./run_all_experiments.sh -t deterministic    # Run only deterministic training
 #   ./run_all_experiments.sh -t probabilistic    # Run only probabilistic training
-#   ./run_all_experiments.sh -d MIMIC            # Run only on MIMIC dataset
-#   ./run_all_experiments.sh -d INALO            # Run only on INALO dataset
-#   ./run_all_experiments.sh -m lstm -t probabilistic -d MIMIC  # Combined filters
+#   ./run_all_experiments.sh --eval-only         # Skip training, only run evaluation
+#   ./run_all_experiments.sh -m lstm -t probabilistic  # Combined filters
 #   ./run_all_experiments.sh -n 5                # Set number of Optuna trials
 #   ./run_all_experiments.sh --small             # Use --small_part flag for quick testing
 #   ./run_all_experiments.sh -h                  # Show help
@@ -27,11 +30,11 @@ NUM_TRIALS=10
 MIMIC_DATA="./data/in-hospital-mortality-fixed/"
 INALO_DATA="./data/in-hospital-mortality-own-final/"
 SMALL_PART=""
+EVAL_ONLY=false
 
 # Default: run all
 SELECTED_MODELS=""
 SELECTED_TYPES=""
-SELECTED_DATASETS=""
 
 # Help function
 show_help() {
@@ -39,6 +42,10 @@ show_help() {
 Usage: $0 [OPTIONS]
 
 Run training experiments for in-hospital mortality prediction.
+
+IMPORTANT: Models are ONLY trained on MIMIC data. They are then evaluated on:
+  1. MIMIC test set (in-domain evaluation)  
+  2. INALO test set (out-of-domain/transfer evaluation)
 
 Options:
   -m, --models MODELS       Comma-separated list of models to train
@@ -49,24 +56,22 @@ Options:
                             Available: deterministic, probabilistic, both
                             Default: both
   
-  -d, --datasets DATASETS   Comma-separated list of datasets to use
-                            Available: MIMIC, INALO
-                            Default: both datasets
-  
   -n, --num-trials N        Number of Optuna trials (default: 10)
   
   -o, --output DIR          Output directory (default: ./output)
   
   --small                   Use --small_part flag for quick testing with limited data
   
+  --eval-only               Skip training, only run evaluation on INALO
+                            (assumes models are already trained)
+  
   -h, --help                Show this help message
 
 Examples:
-  $0                                    # Run all experiments
-  $0 -m lstm                            # Run only LSTM
-  $0 -m lstm,gru -t probabilistic       # Run LSTM and GRU probabilistic only
-  $0 -d MIMIC -t deterministic          # Run all deterministic models on MIMIC
-  $0 -m transformer -d INALO --small    # Quick test transformer on INALO
+  $0                                    # Train all models on MIMIC, eval on MIMIC+INALO
+  $0 -m lstm                            # Train only LSTM on MIMIC, eval on MIMIC+INALO
+  $0 -m lstm,gru -t probabilistic       # Train LSTM and GRU probabilistic only
+  $0 --eval-only                        # Only evaluate existing models on INALO
   $0 -n 5                               # Run all with 5 trials instead of 10
 
 EOF
@@ -84,10 +89,6 @@ while [[ $# -gt 0 ]]; do
             SELECTED_TYPES="$2"
             shift 2
             ;;
-        -d|--datasets)
-            SELECTED_DATASETS="$2"
-            shift 2
-            ;;
         -n|--num-trials)
             NUM_TRIALS="$2"
             shift 2
@@ -98,6 +99,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --small)
             SMALL_PART="--small_part"
+            shift
+            ;;
+        --eval-only)
+            EVAL_ONLY=true
             shift
             ;;
         -h|--help)
@@ -132,22 +137,6 @@ else
     exit 1
 fi
 
-if [ -z "$SELECTED_DATASETS" ]; then
-    RUN_MIMIC=true
-    RUN_INALO=true
-else
-    RUN_MIMIC=false
-    RUN_INALO=false
-    IFS=',' read -ra DATASET_LIST <<< "$SELECTED_DATASETS"
-    for ds in "${DATASET_LIST[@]}"; do
-        case "$ds" in
-            MIMIC) RUN_MIMIC=true ;;
-            INALO) RUN_INALO=true ;;
-            *) echo "Invalid dataset: $ds (use: MIMIC, INALO)"; exit 1 ;;
-        esac
-    done
-fi
-
 # Create output directory
 mkdir -p "$OUTPUT_DIR"
 
@@ -168,57 +157,105 @@ echo "Number of Optuna trials: $NUM_TRIALS"
 echo "Models: ${MODELS[*]}"
 echo "Deterministic: $RUN_DETERMINISTIC"
 echo "Probabilistic: $RUN_PROBABILISTIC"
-echo "MIMIC dataset: $RUN_MIMIC"
-echo "INALO dataset: $RUN_INALO"
+echo "Training on: MIMIC (always)"
+echo "Evaluating on: MIMIC + INALO"
+[ "$EVAL_ONLY" = true ] && echo "Mode: EVALUATION ONLY (skipping training)"
 [ -n "$SMALL_PART" ] && echo "Using --small_part for quick testing"
 echo "=============================================="
 
-# Function to run deterministic training
+# Function to run deterministic training (always on MIMIC)
 run_deterministic() {
     local model=$1
-    local dataset_name=$2
-    local data_path=$3
     
     echo ""
     echo "----------------------------------------------"
-    echo "Training DETERMINISTIC ${model^^} on $dataset_name"
+    echo "Training DETERMINISTIC ${model^^} on MIMIC"
     echo "----------------------------------------------"
     
     python ./ptsa/tasks/in_hospital_mortality/train_deterministic.py \
         --network "./ptsa/models/deterministic/${model}_classification.py" \
         --partition custom \
-        --data "$data_path" \
+        --data "$MIMIC_DATA" \
         --model "$model" \
         --model_name "${model}_deterministic.pth" \
         --output_dir "$OUTPUT_DIR" \
         --num_trials "$NUM_TRIALS" \
         $SMALL_PART
     
-    echo "Completed: ${model^^} deterministic on $dataset_name"
+    echo "Completed: ${model^^} deterministic training on MIMIC"
 }
 
-# Function to run probabilistic training
+# Function to run probabilistic training (always on MIMIC)
 run_probabilistic() {
     local model=$1
-    local dataset_name=$2
-    local data_path=$3
     
     echo ""
     echo "----------------------------------------------"
-    echo "Training PROBABILISTIC ${model^^} + MC Dropout on $dataset_name"
+    echo "Training PROBABILISTIC ${model^^} + MC Dropout on MIMIC"
     echo "----------------------------------------------"
     
     python ./ptsa/tasks/in_hospital_mortality/train_probabilistic.py \
         --network "./ptsa/models/probabilistic/${model}_classification.py" \
         --partition custom \
-        --data "$data_path" \
+        --data "$MIMIC_DATA" \
         --model "$model" \
         --model_name "${model}_probabilistic.pth" \
         --output_dir "$OUTPUT_DIR" \
         --num_trials "$NUM_TRIALS" \
         $SMALL_PART
     
-    echo "Completed: ${model^^} + MC Dropout probabilistic on $dataset_name"
+    echo "Completed: ${model^^} + MC Dropout probabilistic training on MIMIC"
+}
+
+# Function to evaluate a trained model on INALO
+evaluate_on_inalo() {
+    local model=$1
+    local model_type=$2  # deterministic or probabilistic
+    
+    # Find the best model file
+    local model_dir="$OUTPUT_DIR/in-hospital-mortality-fixed/$model_type/$model"
+    
+    # Try to find a config file to determine which trial to use
+    # First check for config_trial_*.json files (newer format)
+    local config_file=$(ls "$model_dir"/config_trial_*.json 2>/dev/null | head -1)
+    local trial_num=""
+    
+    if [ -n "$config_file" ]; then
+        # Extract trial number from config filename
+        trial_num=$(echo "$config_file" | grep -oP 'trial_\K\d+')
+    fi
+    
+    # Find the corresponding model file
+    local model_file=""
+    if [ -n "$trial_num" ]; then
+        model_file="$model_dir/final_model_trial_${trial_num}.pth"
+    fi
+    
+    # Fallback: use first available model file
+    if [ ! -f "$model_file" ]; then
+        model_file=$(ls "$model_dir"/final_model_trial_*.pth 2>/dev/null | head -1)
+    fi
+    
+    if [ -z "$model_file" ] || [ ! -f "$model_file" ]; then
+        echo "Warning: No trained model found at $model_dir"
+        return 1
+    fi
+    
+    echo ""
+    echo "----------------------------------------------"
+    echo "Evaluating ${model_type^^} ${model^^} on INALO"
+    echo "Using model: $model_file"
+    echo "----------------------------------------------"
+    
+    python ./ptsa/tasks/in_hospital_mortality/evaluate_model.py \
+        --model_path "$model_file" \
+        --model "$model" \
+        --model_type "$model_type" \
+        --eval_data "$INALO_DATA" \
+        --eval_name "INALO" \
+        --output_dir "$OUTPUT_DIR/in-hospital-mortality-fixed"
+    
+    echo "Completed: ${model^^} $model_type evaluation on INALO"
 }
 
 # Track start time
@@ -228,22 +265,24 @@ START_TIME=$(date +%s)
 for model in "${MODELS[@]}"; do
     # Deterministic models (no uncertainty)
     if [ "$RUN_DETERMINISTIC" = true ]; then
-        if [ "$RUN_MIMIC" = true ]; then
-            run_deterministic "$model" "MIMIC" "$MIMIC_DATA"
+        # Train on MIMIC (unless --eval-only)
+        if [ "$EVAL_ONLY" = false ]; then
+            run_deterministic "$model"
         fi
-        if [ "$RUN_INALO" = true ]; then
-            run_deterministic "$model" "INALO" "$INALO_DATA"
-        fi
+        
+        # Evaluate on INALO
+        evaluate_on_inalo "$model" "deterministic"
     fi
     
     # Probabilistic models (with MC Dropout uncertainty)
     if [ "$RUN_PROBABILISTIC" = true ]; then
-        if [ "$RUN_MIMIC" = true ]; then
-            run_probabilistic "$model" "MIMIC" "$MIMIC_DATA"
+        # Train on MIMIC (unless --eval-only)
+        if [ "$EVAL_ONLY" = false ]; then
+            run_probabilistic "$model"
         fi
-        if [ "$RUN_INALO" = true ]; then
-            run_probabilistic "$model" "INALO" "$INALO_DATA"
-        fi
+        
+        # Evaluate on INALO
+        evaluate_on_inalo "$model" "probabilistic"
     fi
 done
 
@@ -272,23 +311,30 @@ from pathlib import Path
 output_dir = "./output"
 results = []
 
-# Define expected structure
+# Models trained on MIMIC are stored in: output/in-hospital-mortality-fixed/{type}/{model}/
+# INALO evaluations are stored in: output/in-hospital-mortality-fixed/{type}/{model}/eval_inalo/
+
 models = ["lstm", "rnn", "gru", "transformer"]
-datasets = {
-    "in-hospital-mortality-fixed": "MIMIC",
-    "in-hospital-mortality-own-final": "INALO"
-}
 types = ["deterministic", "probabilistic"]
 
-for dataset_dir, dataset_display in datasets.items():
-    for model_type in types:
-        for model in models:
-            csv_path = Path(output_dir) / dataset_dir / model_type / model / "results_table.csv"
-            if csv_path.exists():
-                df = pd.read_csv(csv_path)
-                results.append(df)
-            else:
-                print(f"Warning: Missing results at {csv_path}")
+# Collect MIMIC results (from training)
+for model_type in types:
+    for model in models:
+        # MIMIC results from training
+        mimic_csv = Path(output_dir) / "in-hospital-mortality-fixed" / model_type / model / "results_table.csv"
+        if mimic_csv.exists():
+            df = pd.read_csv(mimic_csv)
+            results.append(df)
+        else:
+            print(f"Warning: Missing MIMIC results at {mimic_csv}")
+        
+        # INALO results from evaluation
+        inalo_csv = Path(output_dir) / "in-hospital-mortality-fixed" / model_type / model / "eval_inalo" / "results_table.csv"
+        if inalo_csv.exists():
+            df = pd.read_csv(inalo_csv)
+            results.append(df)
+        else:
+            print(f"Warning: Missing INALO evaluation results at {inalo_csv}")
 
 if results:
     # Combine all results
@@ -313,6 +359,8 @@ if results:
     print("\n" + "=" * 80)
     print("COMBINED RESULTS TABLE")
     print("=" * 80)
+    print("Note: All models were trained on MIMIC and evaluated on both MIMIC and INALO")
+    print("")
     print(combined_df.to_string(index=False))
     print("\n")
     print(f"Results saved to: {combined_path}")
