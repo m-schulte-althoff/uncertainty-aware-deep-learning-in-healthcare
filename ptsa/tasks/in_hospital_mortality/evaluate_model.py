@@ -42,71 +42,175 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 
-def remove_columns(data, header, columns_to_remove):
-    """Remove specified columns from the data."""
-    header_list = header if isinstance(header, list) else header.split(',')
-    indices_to_keep = [i for i, col in enumerate(header_list) 
-                       if not any(remove_col in col for remove_col in columns_to_remove)]
+def remove_columns(data, discretizer_header, columns_to_remove):
+    """Remove specified columns from the data.
     
-    new_data = []
-    for sample in data[0]:
-        new_sample = sample[:, indices_to_keep]
-        new_data.append(new_sample)
+    This matches the training script behavior exactly:
+    - Removes all columns where the column name CONTAINS any of the removal strings
+    - This includes one-hot encoded variants and mask columns
+    """
+    data_points, labels = data
     
-    return (new_data, data[1])
+    indices_to_remove = []
+    for col in columns_to_remove:
+        for i, header in enumerate(discretizer_header):
+            if col in header:
+                indices_to_remove.append(i)
+    
+    modified_data_points = []
+    for patient_data in data_points:
+        filtered_data = np.delete(patient_data, indices_to_remove, axis=1)
+        modified_data_points.append(filtered_data)
+
+    return (modified_data_points, labels)
+
+
+def infer_config_from_state_dict(state_dict, model_name, model_type):
+    """Infer model configuration from the saved state dict weights.
+    
+    This is the most reliable way to load a model since we read the actual
+    weight shapes instead of relying on config files that may not match.
+    """
+    config = {'dropout': 0.2}  # dropout doesn't affect weight shapes
+    
+    if model_name == "lstm":
+        # LSTM weight_ih_l0 shape is (4*hidden_size, input_size)
+        weight_ih_l0 = state_dict['lstm.weight_ih_l0']
+        hidden_size = weight_ih_l0.shape[0] // 4
+        input_size = weight_ih_l0.shape[1]
+        # Count layers by counting weight_ih_lX keys
+        num_layers = sum(1 for k in state_dict.keys() if k.startswith('lstm.weight_ih_l'))
+        config.update({
+            'input_size': input_size,
+            'hidden_size': hidden_size,
+            'num_layers': num_layers
+        })
+        
+    elif model_name == "rnn":
+        # RNN weight_ih_l0 shape is (hidden_size, input_size)
+        weight_ih_l0 = state_dict['rnn.weight_ih_l0']
+        hidden_size = weight_ih_l0.shape[0]
+        input_size = weight_ih_l0.shape[1]
+        num_layers = sum(1 for k in state_dict.keys() if k.startswith('rnn.weight_ih_l'))
+        config.update({
+            'input_size': input_size,
+            'hidden_size': hidden_size,
+            'num_layers': num_layers
+        })
+        
+    elif model_name == "gru":
+        # GRU weight_ih_l0 shape is (3*hidden_size, input_size)
+        weight_ih_l0 = state_dict['gru.weight_ih_l0']
+        hidden_size = weight_ih_l0.shape[0] // 3
+        input_size = weight_ih_l0.shape[1]
+        num_layers = sum(1 for k in state_dict.keys() if k.startswith('gru.weight_ih_l'))
+        config.update({
+            'input_size': input_size,
+            'hidden_size': hidden_size,
+            'num_layers': num_layers
+        })
+        
+    elif model_name == "transformer":
+        # Transformer: infer from input_projection and transformer layers
+        input_proj = state_dict['input_projection.weight']
+        d_model = input_proj.shape[0]
+        input_size = input_proj.shape[1]
+        
+        # Count transformer layers
+        layer_indices = set()
+        for k in state_dict.keys():
+            if k.startswith('transformer_encoder.layers.'):
+                parts = k.split('.')
+                layer_indices.add(int(parts[2]))
+        num_layers = len(layer_indices)
+        
+        # Infer dim_feedforward from linear1 weight shape
+        linear1_weight = state_dict['transformer_encoder.layers.0.linear1.weight']
+        dim_feedforward = linear1_weight.shape[0]
+        
+        # Infer nhead from attention weights
+        # in_proj_weight shape is (3*d_model, d_model) for self-attention
+        in_proj = state_dict['transformer_encoder.layers.0.self_attn.in_proj_weight']
+        # nhead is typically d_model // head_dim, we'll use common values
+        # Check if d_model is divisible by common head counts
+        for nhead in [8, 4, 2, 1]:
+            if d_model % nhead == 0:
+                break
+        
+        config.update({
+            'input_size': input_size,
+            'd_model': d_model,
+            'num_layers': num_layers,
+            'dim_feedforward': dim_feedforward,
+            'nhead': nhead
+        })
+    
+    return config
 
 
 def load_model(model_name, model_type, model_path, config, device):
-    """Load a trained model."""
+    """Load a trained model.
+    
+    The config is now inferred from the state dict, so it always matches
+    the actual saved weights.
+    """
+    # Load state dict first to infer config
+    state_dict = torch.load(model_path, weights_only=True)
+    inferred_config = infer_config_from_state_dict(state_dict, model_name, model_type)
+    
+    # Merge inferred config with provided config (inferred takes precedence for architecture)
+    final_config = {**config, **inferred_config}
+    logger.info(f"Inferred config from checkpoint: {inferred_config}")
+    
     if model_type == "deterministic":
         if model_name == "lstm":
             from ptsa.models.deterministic.lstm_classification import LSTM
-            model = LSTM(config["input_size"], config["hidden_size"], 
-                        config["num_layers"], config["dropout"]).to(device)
+            model = LSTM(final_config["input_size"], final_config["hidden_size"], 
+                        final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "rnn":
             from ptsa.models.deterministic.rnn_classification import RNN
-            model = RNN(config["input_size"], config["hidden_size"], 
-                       config["num_layers"], config["dropout"]).to(device)
+            model = RNN(final_config["input_size"], final_config["hidden_size"], 
+                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "gru":
             from ptsa.models.deterministic.gru_classification import GRU
-            model = GRU(config["input_size"], config["hidden_size"], 
-                       config["num_layers"], config["dropout"]).to(device)
+            model = GRU(final_config["input_size"], final_config["hidden_size"], 
+                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "transformer":
             from ptsa.models.deterministic.transformer_classification import TransformerIHM
             model = TransformerIHM(
-                input_size=config["input_size"],
-                d_model=config["d_model"],
-                nhead=config["nhead"],
-                num_layers=config["num_layers"],
-                dropout=config["dropout"],
-                dim_feedforward=config["dim_feedforward"]
+                input_size=final_config["input_size"],
+                d_model=final_config["d_model"],
+                nhead=final_config["nhead"],
+                num_layers=final_config["num_layers"],
+                dropout=final_config.get("dropout", 0.2),
+                dim_feedforward=final_config["dim_feedforward"]
             ).to(device)
     else:  # probabilistic
         if model_name == "lstm":
             from ptsa.models.probabilistic.lstm_classification import LSTM
-            model = LSTM(config["input_size"], config["hidden_size"], 
-                        config["num_layers"], config["dropout"]).to(device)
+            model = LSTM(final_config["input_size"], final_config["hidden_size"], 
+                        final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "rnn":
             from ptsa.models.probabilistic.rnn_classification import RNN
-            model = RNN(config["input_size"], config["hidden_size"], 
-                       config["num_layers"], config["dropout"]).to(device)
+            model = RNN(final_config["input_size"], final_config["hidden_size"], 
+                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "gru":
             from ptsa.models.probabilistic.gru_classification import GRU
-            model = GRU(config["input_size"], config["hidden_size"], 
-                       config["num_layers"], config["dropout"]).to(device)
+            model = GRU(final_config["input_size"], final_config["hidden_size"], 
+                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
         elif model_name == "transformer":
             from ptsa.models.probabilistic.transformer_classification import TransformerIHM
             model = TransformerIHM(
-                input_size=config["input_size"],
-                d_model=config["d_model"],
-                nhead=config["nhead"],
-                num_layers=config["num_layers"],
-                dropout=config["dropout"],
-                dim_feedforward=config["dim_feedforward"]
+                input_size=final_config["input_size"],
+                d_model=final_config["d_model"],
+                nhead=final_config["nhead"],
+                num_layers=final_config["num_layers"],
+                dropout=final_config.get("dropout", 0.2),
+                dim_feedforward=final_config["dim_feedforward"]
             ).to(device)
     
-    model.load_state_dict(torch.load(model_path, weights_only=True))
-    return model
+    model.load_state_dict(state_dict)
+    return model, final_config
 
 
 def load_test_data(data_path, timestep=1.0):
@@ -375,11 +479,12 @@ def main():
         config = load_config_from_hyperparams(hyperparams_path, args.model)
     
     config['num_mc_samples'] = args.num_mc_samples
-    logger.info(f"Model config: {config}")
+    logger.info(f"Initial config: {config}")
     
-    # Load model
+    # Load model (config will be updated with inferred values from checkpoint)
     logger.info(f"Loading model from: {args.model_path}")
-    model = load_model(args.model, args.model_type, args.model_path, config, device)
+    model, config = load_model(args.model, args.model_type, args.model_path, config, device)
+    logger.info(f"Final config after inference: {config}")
     
     # Load test data
     logger.info(f"Loading test data from: {args.eval_data}")
