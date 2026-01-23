@@ -25,7 +25,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, 
     roc_auc_score, f1_score, average_precision_score
@@ -148,72 +147,71 @@ def infer_config_from_state_dict(state_dict, model_name, model_type):
     return config
 
 
-def load_model(model_name, model_type, model_path, config, device):
+def load_model(model_name, model_type, model_path, device):
     """Load a trained model.
     
-    The config is now inferred from the state dict, so it always matches
+    The config is inferred from the state dict, so it always matches
     the actual saved weights.
     """
     # Load state dict first to infer config
-    state_dict = torch.load(model_path, weights_only=True)
+    state_dict = torch.load(model_path, weights_only=True, map_location=device)
     inferred_config = infer_config_from_state_dict(state_dict, model_name, model_type)
     
-    # Merge inferred config with provided config (inferred takes precedence for architecture)
-    final_config = {**config, **inferred_config}
     logger.info(f"Inferred config from checkpoint: {inferred_config}")
     
     if model_type == "deterministic":
         if model_name == "lstm":
             from ptsa.models.deterministic.lstm_classification import LSTM
-            model = LSTM(final_config["input_size"], final_config["hidden_size"], 
-                        final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = LSTM(inferred_config["input_size"], inferred_config["hidden_size"], 
+                        inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "rnn":
             from ptsa.models.deterministic.rnn_classification import RNN
-            model = RNN(final_config["input_size"], final_config["hidden_size"], 
-                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = RNN(inferred_config["input_size"], inferred_config["hidden_size"], 
+                       inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "gru":
             from ptsa.models.deterministic.gru_classification import GRU
-            model = GRU(final_config["input_size"], final_config["hidden_size"], 
-                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = GRU(inferred_config["input_size"], inferred_config["hidden_size"], 
+                       inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "transformer":
             from ptsa.models.deterministic.transformer_classification import TransformerIHM
             model = TransformerIHM(
-                input_size=final_config["input_size"],
-                d_model=final_config["d_model"],
-                nhead=final_config["nhead"],
-                num_layers=final_config["num_layers"],
-                dropout=final_config.get("dropout", 0.2),
-                dim_feedforward=final_config["dim_feedforward"]
+                input_size=inferred_config["input_size"],
+                d_model=inferred_config["d_model"],
+                nhead=inferred_config["nhead"],
+                num_layers=inferred_config["num_layers"],
+                dropout=inferred_config.get("dropout", 0.2),
+                dim_feedforward=inferred_config["dim_feedforward"]
             ).to(device)
     else:  # probabilistic
         if model_name == "lstm":
             from ptsa.models.probabilistic.lstm_classification import LSTM
-            model = LSTM(final_config["input_size"], final_config["hidden_size"], 
-                        final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = LSTM(inferred_config["input_size"], inferred_config["hidden_size"], 
+                        inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "rnn":
             from ptsa.models.probabilistic.rnn_classification import RNN
-            model = RNN(final_config["input_size"], final_config["hidden_size"], 
-                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = RNN(inferred_config["input_size"], inferred_config["hidden_size"], 
+                       inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "gru":
             from ptsa.models.probabilistic.gru_classification import GRU
-            model = GRU(final_config["input_size"], final_config["hidden_size"], 
-                       final_config["num_layers"], final_config.get("dropout", 0.2)).to(device)
+            model = GRU(inferred_config["input_size"], inferred_config["hidden_size"], 
+                       inferred_config["num_layers"], inferred_config.get("dropout", 0.2)).to(device)
         elif model_name == "transformer":
             from ptsa.models.probabilistic.transformer_classification import TransformerIHM
             model = TransformerIHM(
-                input_size=final_config["input_size"],
-                d_model=final_config["d_model"],
-                nhead=final_config["nhead"],
-                num_layers=final_config["num_layers"],
-                dropout=final_config.get("dropout", 0.2),
-                dim_feedforward=final_config["dim_feedforward"]
+                input_size=inferred_config["input_size"],
+                d_model=inferred_config["d_model"],
+                nhead=inferred_config["nhead"],
+                num_layers=inferred_config["num_layers"],
+                dropout=inferred_config.get("dropout", 0.2),
+                dim_feedforward=inferred_config["dim_feedforward"]
             ).to(device)
     
     model.load_state_dict(state_dict)
-    return model, final_config
+    model.eval()
+    return model, inferred_config
 
 
-def load_test_data(data_path, timestep=1.0):
+def load_test_data(data_path, expected_input_size=None, timestep=1.0):
     """Load and preprocess test data from specified path."""
     test_reader = InHospitalMortalityReader(
         dataset_dir=os.path.join(data_path, 'test'), 
@@ -253,63 +251,137 @@ def load_test_data(data_path, timestep=1.0):
     test_raw_data = load_data(test_reader, discretizer, normalizer, False)
     test_raw_data = remove_columns(test_raw_data, discretizer_header, columns_to_remove)
     
-    return test_raw_data
+    # Convert to padded batch format for faster processing
+    data_points, labels = test_raw_data
+    
+    # Find max sequence length and pad
+    max_len = max(x.shape[0] for x in data_points)
+    num_features = data_points[0].shape[1]
+    
+    logger.info(f"Data has {num_features} features, max sequence length {max_len}")
+    
+    # Check if we need to adjust feature count to match model
+    if expected_input_size is not None and num_features != expected_input_size:
+        logger.warning(f"Feature mismatch: data has {num_features} features, model expects {expected_input_size}")
+        if num_features > expected_input_size:
+            # Truncate features
+            data_points = [x[:, :expected_input_size] for x in data_points]
+            num_features = expected_input_size
+            logger.info(f"Truncated data to {num_features} features")
+        else:
+            # Pad features with zeros
+            padded_data_points = []
+            for x in data_points:
+                padded = np.zeros((x.shape[0], expected_input_size))
+                padded[:, :num_features] = x
+                padded_data_points.append(padded)
+            data_points = padded_data_points
+            num_features = expected_input_size
+            logger.info(f"Padded data to {num_features} features")
+    
+    # Pad sequences to same length
+    padded_data = np.zeros((len(data_points), max_len, num_features), dtype=np.float32)
+    for i, x in enumerate(data_points):
+        padded_data[i, :x.shape[0], :] = x
+    
+    labels = np.array(labels, dtype=np.float32)
+    
+    return padded_data, labels
 
 
-def evaluate_model(model, test_data, model_type, device, num_mc_samples=50):
-    """Evaluate model on test data and return metrics."""
+def evaluate_deterministic_batched(model, data, labels, device, batch_size=256):
+    """Evaluate a deterministic model using batched inference."""
     model.eval()
     
     all_predictions = []
-    all_targets = []
-    all_epistemic = []
-    all_aleatoric = []
+    n_samples = len(data)
     
     with torch.no_grad():
-        for i in range(len(test_data[0])):
-            x = test_data[0][i]
-            y = test_data[1][i] if isinstance(test_data[1], list) else test_data[1]
+        for i in range(0, n_samples, batch_size):
+            batch_data = data[i:i+batch_size]
+            x = torch.FloatTensor(batch_data).to(device)
             
-            x = torch.FloatTensor(x).to(device)
-            if x.dim() == 2:
-                x = x.unsqueeze(0)
-            
-            if model_type == "probabilistic":
-                mean, epistemic_var, aleatoric_var = model.predict_with_uncertainty(
-                    x, num_samples=num_mc_samples
-                )
-                all_predictions.append(mean.cpu().numpy())
-                all_epistemic.append(epistemic_var.cpu().numpy())
-                all_aleatoric.append(aleatoric_var.cpu().numpy())
-            else:
-                output = model(x).view(-1)
-                all_predictions.append(output.cpu().numpy())
-            
-            all_targets.append(y)
+            output = model(x)
+            # Apply sigmoid to get probabilities
+            probs = torch.sigmoid(output).cpu().numpy().flatten()
+            all_predictions.extend(probs)
     
-    # Convert to arrays
-    predictions = np.array([p.flatten()[0] if hasattr(p, 'flatten') else p 
-                           for p in all_predictions])
-    targets = np.array(all_targets)
+    predictions = np.array(all_predictions)
     
     # Calculate metrics
     binary_predictions = (predictions >= 0.5).astype(int)
     
     metrics = {
-        'auroc': roc_auc_score(targets, predictions),
-        'auprc': average_precision_score(targets, predictions),
-        'precision': precision_score(targets, binary_predictions, zero_division=0),
-        'recall': recall_score(targets, binary_predictions, zero_division=0),
-        'f1': f1_score(targets, binary_predictions, zero_division=0),
-        'accuracy': accuracy_score(targets, binary_predictions),
+        'auroc': roc_auc_score(labels, predictions),
+        'auprc': average_precision_score(labels, predictions),
+        'precision': precision_score(labels, binary_predictions, zero_division=0),
+        'recall': recall_score(labels, binary_predictions, zero_division=0),
+        'f1': f1_score(labels, binary_predictions, zero_division=0),
+        'accuracy': accuracy_score(labels, binary_predictions),
+        'mean_epistemic': None,
+        'mean_aleatoric': None,
     }
     
-    if model_type == "probabilistic":
-        metrics['mean_epistemic'] = float(np.mean(all_epistemic))
-        metrics['mean_aleatoric'] = float(np.mean(all_aleatoric))
-    else:
-        metrics['mean_epistemic'] = None
-        metrics['mean_aleatoric'] = None
+    return metrics
+
+
+def evaluate_probabilistic_batched(model, data, labels, device, num_mc_samples=50, batch_size=128):
+    """Evaluate a probabilistic model using batched MC Dropout inference."""
+    model.train()  # Keep dropout enabled for MC sampling
+    
+    n_samples = len(data)
+    all_mean_preds = []
+    all_epistemic = []
+    all_aleatoric = []
+    
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            batch_data = data[i:i+batch_size]
+            x = torch.FloatTensor(batch_data).to(device)
+            
+            # MC Dropout: run multiple forward passes
+            mc_outputs = []
+            mc_log_vars = []
+            
+            for _ in range(num_mc_samples):
+                output, log_var = model(x)
+                mc_outputs.append(torch.sigmoid(output))
+                mc_log_vars.append(log_var)
+            
+            # Stack MC samples: (num_mc_samples, batch_size, 1)
+            mc_outputs = torch.stack(mc_outputs, dim=0)
+            mc_log_vars = torch.stack(mc_log_vars, dim=0)
+            
+            # Mean prediction across MC samples
+            mean_pred = mc_outputs.mean(dim=0).cpu().numpy().flatten()
+            
+            # Epistemic uncertainty: variance of predictions across MC samples
+            epistemic = mc_outputs.var(dim=0).cpu().numpy().flatten()
+            
+            # Aleatoric uncertainty: mean of predicted variances
+            aleatoric = torch.exp(mc_log_vars).mean(dim=0).cpu().numpy().flatten()
+            
+            all_mean_preds.extend(mean_pred)
+            all_epistemic.extend(epistemic)
+            all_aleatoric.extend(aleatoric)
+    
+    predictions = np.array(all_mean_preds)
+    epistemic_arr = np.array(all_epistemic)
+    aleatoric_arr = np.array(all_aleatoric)
+    
+    # Calculate metrics
+    binary_predictions = (predictions >= 0.5).astype(int)
+    
+    metrics = {
+        'auroc': roc_auc_score(labels, predictions),
+        'auprc': average_precision_score(labels, predictions),
+        'precision': precision_score(labels, binary_predictions, zero_division=0),
+        'recall': recall_score(labels, binary_predictions, zero_division=0),
+        'f1': f1_score(labels, binary_predictions, zero_division=0),
+        'accuracy': accuracy_score(labels, binary_predictions),
+        'mean_epistemic': float(np.mean(epistemic_arr)),
+        'mean_aleatoric': float(np.mean(aleatoric_arr)),
+    }
     
     return metrics
 
@@ -362,69 +434,6 @@ def save_results(metrics, model_name, model_type, eval_name, output_dir):
     return results_df
 
 
-def load_config_from_hyperparams(hyperparams_path, model_name):
-    """Load model config from best_hyperparams.txt or config_trial_X.json file."""
-    config = {}
-    
-    # First try to load JSON config (preferred - more reliable)
-    if hyperparams_path and hyperparams_path.endswith('.json') and os.path.exists(hyperparams_path):
-        with open(hyperparams_path, 'r') as f:
-            import json
-            config = json.load(f)
-        logger.info(f"Loaded config from JSON: {hyperparams_path}")
-        return config
-    
-    # Try to find a config JSON file matching the model path
-    if hyperparams_path:
-        model_dir = os.path.dirname(hyperparams_path) if not os.path.isdir(hyperparams_path) else hyperparams_path
-        # If we have a model file path, try to find corresponding config
-        # e.g., final_model_trial_0.pth -> config_trial_0.json
-        for f in os.listdir(model_dir) if os.path.exists(model_dir) else []:
-            if f.startswith('config_trial_') and f.endswith('.json'):
-                json_path = os.path.join(model_dir, f)
-                with open(json_path, 'r') as jf:
-                    import json
-                    config = json.load(jf)
-                logger.info(f"Loaded config from: {json_path}")
-                return config
-    
-    # Fallback: try to load from best_hyperparams.txt
-    if hyperparams_path and os.path.exists(hyperparams_path):
-        with open(hyperparams_path, 'r') as f:
-            for line in f:
-                if ':' in line:
-                    key, value = line.strip().split(':', 1)
-                    key = key.strip()
-                    value = value.strip()
-                    
-                    # Parse values
-                    try:
-                        if '.' in value:
-                            config[key] = float(value)
-                        else:
-                            config[key] = int(value)
-                    except ValueError:
-                        config[key] = value
-    
-    # Set defaults for missing values
-    defaults = {
-        'input_size': 59,  # After removing columns
-        'hidden_size': config.get('hidden_size', 64),
-        'num_layers': config.get('num_layers', 2),
-        'dropout': config.get('dropout', 0.2),
-        'd_model': config.get('d_model', 64),
-        'nhead': config.get('nhead', 4),
-        'dim_feedforward': config.get('dim_feedforward', 256),
-        'num_mc_samples': config.get('num_mc_samples', 50),
-    }
-    
-    for key, value in defaults.items():
-        if key not in config:
-            config[key] = value
-    
-    return config
-
-
 def main():
     parser = argparse.ArgumentParser(description='Evaluate trained model on test data')
     parser.add_argument('--model_path', type=str, required=True,
@@ -441,8 +450,6 @@ def main():
                        help='Display name for evaluation dataset (e.g., INALO, MIMIC)')
     parser.add_argument('--output_dir', type=str, required=True,
                        help='Base output directory for results')
-    parser.add_argument('--config_path', type=str, default=None,
-                       help='Path to best_hyperparams.txt (optional)')
     parser.add_argument('--num_mc_samples', type=int, default=50,
                        help='Number of MC samples for probabilistic models')
     
@@ -451,50 +458,27 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info(f"Using device: {device}")
     
-    # Load config - try to find config matching the specific model trial
-    model_dir = os.path.dirname(args.model_path)
-    model_filename = os.path.basename(args.model_path)
-    
-    # Extract trial number from model filename (e.g., final_model_trial_0.pth -> 0)
-    import re
-    trial_match = re.search(r'trial_(\d+)', model_filename)
-    trial_num = trial_match.group(1) if trial_match else None
-    
-    config = None
-    
-    # First, try to load config for this specific trial
-    if trial_num:
-        trial_config_path = os.path.join(model_dir, f"config_trial_{trial_num}.json")
-        if os.path.exists(trial_config_path):
-            config = load_config_from_hyperparams(trial_config_path, args.model)
-            logger.info(f"Loaded trial-specific config from: {trial_config_path}")
-    
-    # If no trial-specific config, try the provided config_path
-    if config is None and args.config_path and os.path.exists(args.config_path):
-        config = load_config_from_hyperparams(args.config_path, args.model)
-    
-    # Fallback: try to find any config in model directory
-    if config is None:
-        hyperparams_path = os.path.join(model_dir, 'best_hyperparams.txt')
-        config = load_config_from_hyperparams(hyperparams_path, args.model)
-    
-    config['num_mc_samples'] = args.num_mc_samples
-    logger.info(f"Initial config: {config}")
-    
-    # Load model (config will be updated with inferred values from checkpoint)
+    # Load model (config is inferred from checkpoint)
     logger.info(f"Loading model from: {args.model_path}")
-    model, config = load_model(args.model, args.model_type, args.model_path, config, device)
-    logger.info(f"Final config after inference: {config}")
+    model, config = load_model(args.model, args.model_type, args.model_path, device)
     
-    # Load test data
+    # Load test data, passing expected input size for compatibility check
     logger.info(f"Loading test data from: {args.eval_data}")
-    test_data = load_test_data(args.eval_data)
-    logger.info(f"Loaded {len(test_data[0])} test samples")
+    test_data, test_labels = load_test_data(
+        args.eval_data, 
+        expected_input_size=config.get('input_size')
+    )
+    logger.info(f"Loaded {len(test_labels)} test samples, shape: {test_data.shape}")
     
     # Evaluate
     logger.info("Evaluating model...")
-    metrics = evaluate_model(model, test_data, args.model_type, device, 
-                            config['num_mc_samples'])
+    if args.model_type == "deterministic":
+        metrics = evaluate_deterministic_batched(model, test_data, test_labels, device)
+    else:
+        metrics = evaluate_probabilistic_batched(
+            model, test_data, test_labels, device, 
+            num_mc_samples=args.num_mc_samples
+        )
     
     # Save results
     # Output structure: {output_dir}/{model_type}/{model}/eval_{eval_name}/
