@@ -29,6 +29,9 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, 
     roc_auc_score, f1_score, average_precision_score
 )
+import matplotlib
+matplotlib.use('Agg')  # Non-interactive backend for headless environments
+import matplotlib.pyplot as plt
 
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
@@ -302,8 +305,7 @@ def evaluate_deterministic_batched(model, data, labels, device, batch_size=256):
             x = torch.FloatTensor(batch_data).to(device)
             
             output = model(x)
-            # Apply sigmoid to get probabilities
-            probs = torch.sigmoid(output).cpu().numpy().flatten()
+            probs = output.cpu().numpy().flatten()
             all_predictions.extend(probs)
     
     predictions = np.array(all_predictions)
@@ -322,7 +324,7 @@ def evaluate_deterministic_batched(model, data, labels, device, batch_size=256):
         'mean_aleatoric': None,
     }
     
-    return metrics
+    return metrics, predictions, labels
 
 
 def evaluate_probabilistic_batched(model, data, labels, device, num_mc_samples=50, batch_size=128):
@@ -345,7 +347,8 @@ def evaluate_probabilistic_batched(model, data, labels, device, num_mc_samples=5
             
             for _ in range(num_mc_samples):
                 output, log_var = model(x)
-                mc_outputs.append(torch.sigmoid(output))
+                # Model already applies sigmoid internally - use output directly as probabilities
+                mc_outputs.append(output)
                 mc_log_vars.append(log_var)
             
             # Stack MC samples: (num_mc_samples, batch_size, 1)
@@ -383,7 +386,69 @@ def evaluate_probabilistic_batched(model, data, labels, device, num_mc_samples=5
         'mean_aleatoric': float(np.mean(aleatoric_arr)),
     }
     
-    return metrics
+    return metrics, predictions, labels
+
+
+def compute_ece(y_true, y_pred, n_bins=10):
+    """Compute Expected Calibration Error."""
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    bins = np.linspace(0., 1. + 1e-8, n_bins + 1)
+    binids = np.digitize(y_pred, bins) - 1
+
+    bin_sums = np.zeros(n_bins)
+    bin_true = np.zeros(n_bins)
+    bin_counts = np.zeros(n_bins)
+
+    for i in range(len(y_pred)):
+        bin_sums[binids[i]] += y_pred[i]
+        bin_true[binids[i]] += y_true[i]
+        bin_counts[binids[i]] += 1
+
+    bin_confidences = bin_sums / (bin_counts + 1e-8)
+    bin_accuracies = bin_true / (bin_counts + 1e-8)
+
+    ece = np.sum(np.abs(bin_accuracies - bin_confidences) * (bin_counts / len(y_pred)))
+
+    return ece, bin_confidences, bin_accuracies, bin_counts
+
+
+def plot_calibration_curve(y_true, y_pred, model_display, eval_name, save_path, n_bins=10):
+    """Plot and save a calibration curve (reliability diagram)."""
+    ece, confidences, accuracies, counts = compute_ece(y_true, y_pred, n_bins=n_bins)
+
+    # Only plot bins that have samples
+    mask = counts > 0
+    conf_plot = confidences[mask]
+    acc_plot = accuracies[mask]
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot([0, 1], [0, 1], 'k--', label='Perfectly calibrated')
+    ax.plot(conf_plot, acc_plot, 'b-o', linewidth=2, markersize=8, label='Model calibration')
+    ax.fill_between(conf_plot, acc_plot, conf_plot, alpha=0.2, color='blue',
+                     label='Miscalibration area')
+
+    ax.text(0.05, 0.95, f'ECE = {ece:.4f}',
+            transform=ax.transAxes, fontsize=12,
+            verticalalignment='top',
+            bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+    ax.set_xlabel('Predicted Probability', fontsize=12)
+    ax.set_ylabel('Observed Frequency', fontsize=12)
+    ax.set_title(f'Calibration Curve — {model_display} on {eval_name}', fontsize=14)
+    ax.legend(loc='lower right', fontsize=10)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    logger.info(f"Calibration curve saved to: {save_path}")
+
+    return ece
 
 
 def save_results(metrics, model_name, model_type, eval_name, output_dir):
@@ -473,9 +538,9 @@ def main():
     # Evaluate
     logger.info("Evaluating model...")
     if args.model_type == "deterministic":
-        metrics = evaluate_deterministic_batched(model, test_data, test_labels, device)
+        metrics, predictions, labels = evaluate_deterministic_batched(model, test_data, test_labels, device)
     else:
-        metrics = evaluate_probabilistic_batched(
+        metrics, predictions, labels = evaluate_probabilistic_batched(
             model, test_data, test_labels, device, 
             num_mc_samples=args.num_mc_samples
         )
@@ -484,6 +549,17 @@ def main():
     # Output structure: {output_dir}/{model_type}/{model}/eval_{eval_name}/
     full_output_dir = os.path.join(args.output_dir, args.model_type, args.model)
     save_results(metrics, args.model, args.model_type, args.eval_name, full_output_dir)
+    
+    # Plot calibration curve
+    if args.model_type == "probabilistic":
+        model_display = f"{args.model.upper()} + MC Dropout"
+    else:
+        model_display = args.model.upper()
+    cal_dir = os.path.join(full_output_dir, f"eval_{args.eval_name.lower()}")
+    os.makedirs(cal_dir, exist_ok=True)
+    cal_path = os.path.join(cal_dir, 'calibration_curve.png')
+    ece = plot_calibration_curve(labels, predictions, model_display, args.eval_name, cal_path)
+    metrics['ece'] = ece
     
     logger.info("Evaluation complete!")
     return metrics

@@ -258,6 +258,52 @@ evaluate_on_inalo() {
     echo "Completed: ${model^^} $model_type evaluation on INALO"
 }
 
+# Function to evaluate a trained model on MIMIC test set (for calibration curves)
+evaluate_on_mimic() {
+    local model=$1
+    local model_type=$2  # deterministic or probabilistic
+    
+    # Find the best model file
+    local model_dir="$OUTPUT_DIR/in-hospital-mortality-fixed/$model_type/$model"
+    
+    local config_file=$(ls "$model_dir"/config_trial_*.json 2>/dev/null | head -1)
+    local trial_num=""
+    
+    if [ -n "$config_file" ]; then
+        trial_num=$(echo "$config_file" | grep -oP 'trial_\K\d+')
+    fi
+    
+    local model_file=""
+    if [ -n "$trial_num" ]; then
+        model_file="$model_dir/final_model_trial_${trial_num}.pth"
+    fi
+    
+    if [ ! -f "$model_file" ]; then
+        model_file=$(ls "$model_dir"/final_model_trial_*.pth 2>/dev/null | head -1)
+    fi
+    
+    if [ -z "$model_file" ] || [ ! -f "$model_file" ]; then
+        echo "Warning: No trained model found at $model_dir - skipping MIMIC eval"
+        return 1
+    fi
+    
+    echo ""
+    echo "----------------------------------------------"
+    echo "Evaluating ${model_type^^} ${model^^} on MIMIC (calibration)"
+    echo "Using model: $model_file"
+    echo "----------------------------------------------"
+    
+    python ./ptsa/tasks/in_hospital_mortality/evaluate_model.py \
+        --model_path "$model_file" \
+        --model "$model" \
+        --model_type "$model_type" \
+        --eval_data "$MIMIC_DATA" \
+        --eval_name "MIMIC" \
+        --output_dir "$OUTPUT_DIR/in-hospital-mortality-fixed"
+    
+    echo "Completed: ${model^^} $model_type evaluation on MIMIC"
+}
+
 # Track start time
 START_TIME=$(date +%s)
 
@@ -270,6 +316,8 @@ for model in "${MODELS[@]}"; do
             run_deterministic "$model"
         fi
         
+        # Evaluate on MIMIC test set (calibration curves)
+        evaluate_on_mimic "$model" "deterministic"
         # Evaluate on INALO
         evaluate_on_inalo "$model" "deterministic"
     fi
@@ -281,6 +329,8 @@ for model in "${MODELS[@]}"; do
             run_probabilistic "$model"
         fi
         
+        # Evaluate on MIMIC test set (calibration curves)
+        evaluate_on_mimic "$model" "probabilistic"
         # Evaluate on INALO
         evaluate_on_inalo "$model" "probabilistic"
     fi
@@ -369,5 +419,92 @@ else:
     print("No results found to aggregate!")
 EOF
 
+# Generate combined calibration curves overview
+echo ""
+echo "Generating combined calibration curve overview..."
+
+python << 'CALEOF'
+import os
+import glob
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+output_dir = "./output"
+base = Path(output_dir) / "in-hospital-mortality-fixed"
+
+models = ["lstm", "rnn", "gru", "transformer"]
+types = ["deterministic", "probabilistic"]
+datasets = ["mimic", "inalo"]
+
+# Collect all calibration curve images
+cal_files = []
+for model_type in types:
+    for model in models:
+        for ds in datasets:
+            cal_path = base / model_type / model / f"eval_{ds}" / "calibration_curve.png"
+            if cal_path.exists():
+                if model_type == "probabilistic":
+                    label = f"{model.upper()} + MC Dropout"
+                else:
+                    label = model.upper()
+                cal_files.append({
+                    'path': str(cal_path),
+                    'model': label,
+                    'dataset': ds.upper(),
+                    'type': model_type
+                })
+
+if cal_files:
+    n = len(cal_files)
+    # Arrange in a grid: rows = models, cols = datasets
+    ncols = 2  # MIMIC, INALO
+    nrows = (n + ncols - 1) // ncols
+    nrows = max(nrows, 1)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(8 * ncols, 8 * nrows))
+    if nrows == 1 and ncols == 1:
+        axes = np.array([[axes]])
+    elif nrows == 1:
+        axes = axes[np.newaxis, :]
+    elif ncols == 1:
+        axes = axes[:, np.newaxis]
+
+    # Track which subplots are used
+    used = set()
+    row = 0
+    for model_type in types:
+        for model in models:
+            for col, ds in enumerate(datasets):
+                cal_path = base / model_type / model / f"eval_{ds}" / "calibration_curve.png"
+                if cal_path.exists():
+                    img = plt.imread(str(cal_path))
+                    if row < nrows:
+                        axes[row, col].imshow(img)
+                        axes[row, col].axis('off')
+                        used.add((row, col))
+            if any((base / model_type / model / f"eval_{ds}" / "calibration_curve.png").exists() for ds in datasets):
+                row += 1
+
+    # Hide unused axes
+    for r in range(nrows):
+        for c in range(ncols):
+            if (r, c) not in used:
+                axes[r, c].axis('off')
+
+    plt.suptitle('Calibration Curves — All Models', fontsize=18, y=1.01)
+    plt.tight_layout()
+    overview_path = Path(output_dir) / "calibration_curves_overview.png"
+    fig.savefig(str(overview_path), dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"Combined calibration overview saved to: {overview_path}")
+    print(f"Individual calibration curves are in each model's eval_*/calibration_curve.png")
+else:
+    print("No calibration curve images found to combine.")
+CALEOF
+
 echo ""
 echo "Done! Check $OUTPUT_DIR/combined_results.csv for the full table."
+echo "Check $OUTPUT_DIR/calibration_curves_overview.png for calibration curves."
